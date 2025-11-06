@@ -961,3 +961,124 @@ class InpaintStitchImproved:
         output_image = stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm)
 
         return (output_image,)
+
+
+class InpaintStitcherDebug:
+    """
+    Debug node to visualize the contents of a STITCHER object.
+    Shows canvas images, crop regions, masks, and metadata.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+            }
+        }
+
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Debug visualization for STITCHER object - shows canvas, crop regions, masks, and metadata"
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("canvas_images", "canvas_with_orig_box", "canvas_with_crop_box", "blend_masks", "metadata_text")
+
+    FUNCTION = "debug_stitcher"
+
+    def debug_stitcher(self, stitcher):
+        # Extract batch size
+        batch_size = len(stitcher['canvas_image'])
+
+        # Prepare outputs
+        canvas_images = []
+        canvas_with_orig = []
+        canvas_with_crop = []
+        blend_masks = []
+        metadata_lines = []
+
+        metadata_lines.append("=" * 60)
+        metadata_lines.append("STITCHER DEBUG INFORMATION")
+        metadata_lines.append("=" * 60)
+        metadata_lines.append(f"Batch Size: {batch_size}")
+        metadata_lines.append(f"Downscale Algorithm: {stitcher['downscale_algorithm']}")
+        metadata_lines.append(f"Upscale Algorithm: {stitcher['upscale_algorithm']}")
+        metadata_lines.append(f"Blend Pixels: {stitcher['blend_pixels']}")
+        metadata_lines.append("")
+
+        for b in range(batch_size):
+            # Get values for this batch item
+            canvas_image = stitcher['canvas_image'][b]
+            cto_x = stitcher['canvas_to_orig_x'][b]
+            cto_y = stitcher['canvas_to_orig_y'][b]
+            cto_w = stitcher['canvas_to_orig_w'][b]
+            cto_h = stitcher['canvas_to_orig_h'][b]
+            ctc_x = stitcher['cropped_to_canvas_x'][b]
+            ctc_y = stitcher['cropped_to_canvas_y'][b]
+            ctc_w = stitcher['cropped_to_canvas_w'][b]
+            ctc_h = stitcher['cropped_to_canvas_h'][b]
+            blend_mask = stitcher['cropped_mask_for_blend'][b]
+
+            # Add metadata for this image
+            metadata_lines.append(f"--- Image {b + 1} ---")
+            metadata_lines.append(f"Canvas Size: {canvas_image.shape[2]}W × {canvas_image.shape[1]}H")
+            metadata_lines.append(f"Original in Canvas: ({cto_x}, {cto_y}) size {cto_w}×{cto_h}")
+            metadata_lines.append(f"Crop in Canvas: ({ctc_x}, {ctc_y}) size {ctc_w}×{ctc_h}")
+            metadata_lines.append(f"Blend Mask Size: {blend_mask.shape[2]}W × {blend_mask.shape[1]}H")
+            metadata_lines.append("")
+
+            # 1. Canvas image (as-is)
+            canvas_images.append(canvas_image)
+
+            # 2. Canvas with original image region highlighted (green box)
+            canvas_orig_debug = canvas_image.clone()
+            # Draw green rectangle around original image location
+            canvas_orig_debug = self._draw_box(canvas_orig_debug, cto_x, cto_y, cto_w, cto_h,
+                                               color=[0.0, 1.0, 0.0], thickness=3)
+            canvas_with_orig.append(canvas_orig_debug)
+
+            # 3. Canvas with crop region highlighted (red box)
+            canvas_crop_debug = canvas_image.clone()
+            # Draw red rectangle around crop region
+            canvas_crop_debug = self._draw_box(canvas_crop_debug, ctc_x, ctc_y, ctc_w, ctc_h,
+                                               color=[1.0, 0.0, 0.0], thickness=3)
+            canvas_with_crop.append(canvas_crop_debug)
+
+            # 4. Blend mask
+            blend_masks.append(blend_mask)
+
+        # Stack all outputs
+        canvas_images_batch = torch.cat(canvas_images, dim=0)
+        canvas_with_orig_batch = torch.cat(canvas_with_orig, dim=0)
+        canvas_with_crop_batch = torch.cat(canvas_with_crop, dim=0)
+        blend_masks_batch = torch.cat(blend_masks, dim=0)
+        metadata_text = "\n".join(metadata_lines)
+
+        return (canvas_images_batch, canvas_with_orig_batch, canvas_with_crop_batch,
+                blend_masks_batch, metadata_text)
+
+    def _draw_box(self, image, x, y, w, h, color=[1.0, 0.0, 0.0], thickness=2):
+        """Draw a colored box on the image"""
+        img = image.clone()
+
+        # Clamp coordinates to image bounds
+        img_h, img_w = img.shape[1], img.shape[2]
+        x = max(0, min(x, img_w - 1))
+        y = max(0, min(y, img_h - 1))
+        x2 = max(0, min(x + w, img_w))
+        y2 = max(0, min(y + h, img_h))
+
+        # Draw box edges
+        for t in range(thickness):
+            # Top edge
+            if y + t < img_h:
+                img[0, y + t, x:x2, :] = torch.tensor(color, device=img.device)
+            # Bottom edge
+            if y2 - t - 1 >= 0 and y2 - t - 1 < img_h:
+                img[0, y2 - t - 1, x:x2, :] = torch.tensor(color, device=img.device)
+            # Left edge
+            if x + t < img_w:
+                img[0, y:y2, x + t, :] = torch.tensor(color, device=img.device)
+            # Right edge
+            if x2 - t - 1 >= 0 and x2 - t - 1 < img_w:
+                img[0, y:y2, x2 - t - 1, :] = torch.tensor(color, device=img.device)
+
+        return img
