@@ -6,23 +6,68 @@ import torch
 import torchvision.transforms.functional as F
 from PIL import Image
 from scipy.ndimage import gaussian_filter, grey_dilation, binary_closing, binary_fill_holes
+import time
+
+
+def print_gpu_info():
+    """Print GPU availability and device information"""
+    print("\n[DEBUG] ========== GPU/Device Information ==========")
+    print(f"[DEBUG] PyTorch version: {torch.__version__}")
+    print(f"[DEBUG] CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[DEBUG] CUDA version: {torch.version.cuda}")
+        print(f"[DEBUG] Current CUDA device: {torch.cuda.current_device()}")
+        print(f"[DEBUG] Device name: {torch.cuda.get_device_name(0)}")
+        print(f"[DEBUG] Device count: {torch.cuda.device_count()}")
+        # Memory info
+        allocated = torch.cuda.memory_allocated(0) / 1024**3
+        reserved = torch.cuda.memory_reserved(0) / 1024**3
+        print(f"[DEBUG] GPU memory allocated: {allocated:.2f} GB")
+        print(f"[DEBUG] GPU memory reserved: {reserved:.2f} GB")
+    else:
+        print("[DEBUG] WARNING: CUDA not available! All operations will run on CPU.")
+    print("[DEBUG] ================================================\n")
 
 
 def rescale_i(samples, width, height, algorithm: str):
+    start_time = time.time()
+    device = samples.device
+    print(f"[DEBUG] rescale_i: Resizing image to {width}x{height} using {algorithm}, device={device}")
+
     samples = samples.movedim(-1, 1)
     algorithm = getattr(Image, algorithm.upper())  # i.e. Image.BICUBIC
+
+    cpu_start = time.time()
     samples_pil: Image.Image = F.to_pil_image(samples[0].cpu()).resize((width, height), algorithm)
+    cpu_time = time.time() - cpu_start
+    print(f"[DEBUG] rescale_i: CPU transfer + PIL resize took {cpu_time:.4f}s")
+
     samples = F.to_tensor(samples_pil).unsqueeze(0)
     samples = samples.movedim(1, -1)
+
+    total_time = time.time() - start_time
+    print(f"[DEBUG] rescale_i: Total time {total_time:.4f}s")
     return samples
 
 
 def rescale_m(samples, width, height, algorithm: str):
+    start_time = time.time()
+    device = samples.device
+    print(f"[DEBUG] rescale_m: Resizing mask to {width}x{height} using {algorithm}, device={device}")
+
     samples = samples.unsqueeze(1)
     algorithm = getattr(Image, algorithm.upper())  # i.e. Image.BICUBIC
+
+    cpu_start = time.time()
     samples_pil: Image.Image = F.to_pil_image(samples[0].cpu()).resize((width, height), algorithm)
+    cpu_time = time.time() - cpu_start
+    print(f"[DEBUG] rescale_m: CPU transfer + PIL resize took {cpu_time:.4f}s")
+
     samples = F.to_tensor(samples_pil).unsqueeze(0)
     samples = samples.squeeze(1)
+
+    total_time = time.time() - start_time
+    print(f"[DEBUG] rescale_m: Total time {total_time:.4f}s")
     return samples
 
 
@@ -104,18 +149,30 @@ def preresize_imm(image, mask, optional_context_mask, downscale_algorithm, upsca
 
 
 def fillholes_iterative_hipass_fill_m(samples):
+    start_time = time.time()
+    device = samples.device
+    print(f"[DEBUG] fillholes_iterative_hipass_fill_m: Starting hole filling on device={device}")
+
     thresholds = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 
+    cpu_start = time.time()
     mask_np = samples.squeeze(0).cpu().numpy()
+    cpu_time = time.time() - cpu_start
+    print(f"[DEBUG] fillholes_iterative_hipass_fill_m: GPU->CPU transfer took {cpu_time:.4f}s")
 
+    scipy_start = time.time()
     for threshold in thresholds:
         thresholded_mask = mask_np >= threshold
         closed_mask = binary_closing(thresholded_mask, structure=np.ones((3, 3)), border_value=1)
         filled_mask = binary_fill_holes(closed_mask)
         mask_np = np.maximum(mask_np, np.where(filled_mask != 0, threshold, 0))
+    scipy_time = time.time() - scipy_start
+    print(f"[DEBUG] fillholes_iterative_hipass_fill_m: Scipy operations (CPU-only) took {scipy_time:.4f}s")
 
     final_mask = torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(0)
 
+    total_time = time.time() - start_time
+    print(f"[DEBUG] fillholes_iterative_hipass_fill_m: Total time {total_time:.4f}s")
     return final_mask
 
 
@@ -126,14 +183,30 @@ def hipassfilter_m(samples, threshold):
 
 
 def expand_m(mask, pixels):
+    start_time = time.time()
+    device = mask.device
+    print(f"[DEBUG] expand_m: Expanding mask by {pixels} pixels, device={device}")
+
     sigma = pixels / 4
+
+    cpu_start = time.time()
     mask_np = mask.squeeze(0).cpu().numpy()
+    cpu_time = time.time() - cpu_start
+    print(f"[DEBUG] expand_m: GPU->CPU transfer took {cpu_time:.4f}s")
+
+    scipy_start = time.time()
     kernel_size = math.ceil(sigma * 1.5 + 1)
     kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     dilated_mask = grey_dilation(mask_np, footprint=kernel)
     dilated_mask = dilated_mask.astype(np.float32)
+    scipy_time = time.time() - scipy_start
+    print(f"[DEBUG] expand_m: Scipy grey_dilation (CPU-only) took {scipy_time:.4f}s")
+
     dilated_mask = torch.from_numpy(dilated_mask)
     dilated_mask = torch.clamp(dilated_mask, 0.0, 1.0)
+
+    total_time = time.time() - start_time
+    print(f"[DEBUG] expand_m: Total time {total_time:.4f}s")
     return dilated_mask.unsqueeze(0)
 
 
@@ -144,16 +217,36 @@ def invert_m(samples):
 
 
 def blur_m(samples, pixels):
+    start_time = time.time()
+    device = samples.device
+    print(f"[DEBUG] blur_m: Blurring mask with {pixels} pixels, device={device}")
+
     mask = samples.squeeze(0)
-    sigma = pixels / 4 
+    sigma = pixels / 4
+
+    cpu_start = time.time()
     mask_np = mask.cpu().numpy()
+    cpu_time = time.time() - cpu_start
+    print(f"[DEBUG] blur_m: GPU->CPU transfer took {cpu_time:.4f}s")
+
+    scipy_start = time.time()
     blurred_mask = gaussian_filter(mask_np, sigma=sigma)
+    scipy_time = time.time() - scipy_start
+    print(f"[DEBUG] blur_m: Scipy gaussian_filter (CPU-only) took {scipy_time:.4f}s")
+
     blurred_mask = torch.from_numpy(blurred_mask).float()
     blurred_mask = torch.clamp(blurred_mask, 0.0, 1.0)
+
+    total_time = time.time() - start_time
+    print(f"[DEBUG] blur_m: Total time {total_time:.4f}s")
     return blurred_mask.unsqueeze(0)
 
 
 def extend_imm(image, mask, optional_context_mask, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor):
+    start_time = time.time()
+    device = image.device
+    print(f"[DEBUG] extend_imm: Extending image for outpainting, device={device}")
+
     B, H, W, C = image.shape
 
     new_H = int(H * (1.0 + extend_up_factor - 1.0 + extend_down_factor - 1.0))
@@ -162,9 +255,12 @@ def extend_imm(image, mask, optional_context_mask, extend_up_factor, extend_down
     assert new_H >= 0, f"Error: Trying to crop too much, height ({new_H}) must be >= 0"
     assert new_W >= 0, f"Error: Trying to crop too much, width ({new_W}) must be >= 0"
 
+    gpu_start = time.time()
     expanded_image = torch.zeros(1, new_H, new_W, C, device=image.device)
     expanded_mask = torch.ones(1, new_H, new_W, device=mask.device)
     expanded_optional_context_mask = torch.zeros(1, new_H, new_W, device=optional_context_mask.device)
+    gpu_time = time.time() - gpu_start
+    print(f"[DEBUG] extend_imm: GPU tensor allocation took {gpu_time:.4f}s")
 
     up_padding = int(H * (extend_up_factor - 1.0))
     down_padding = new_H - H - up_padding
@@ -200,6 +296,8 @@ def extend_imm(image, mask, optional_context_mask, extend_up_factor, extend_down
     expanded_image = expanded_image.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
     image = image.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
 
+    total_time = time.time() - start_time
+    print(f"[DEBUG] extend_imm: Total time {total_time:.4f}s")
     return expanded_image, expanded_mask, expanded_optional_context_mask
 
 
@@ -298,9 +396,14 @@ def pad_to_multiple(value, multiple):
 
 
 def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscale_algorithm, upscale_algorithm):
+    start_time = time.time()
+    device = image.device
+    print(f"[DEBUG] crop_magic_im: Starting crop operation, device={device}")
+    print(f"[DEBUG] crop_magic_im: Context area ({x}, {y}, {w}, {h}), target size {target_w}x{target_h}")
+
     image = image.clone()
     mask = mask.clone()
-    
+
     # Ok this is the most complex function in this node. The one that does the magic after all the preparation done by the other nodes.
     # Basically this function determines the right context area that encompasses the whole context area (mask+optional_context_mask),
     # that is ideally within the bounds of the original image, and that has the right aspect ratio to match target width and height.
@@ -441,6 +544,7 @@ def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscal
 
     # Step 7: Resize image and mask to the target width and height
     # Decide which algorithm to use based on the scaling direction
+    print(f"[DEBUG] crop_magic_im: Resizing from {ctc_w}x{ctc_h} to {target_w}x{target_h}")
     if target_w > ctc_w or target_h > ctc_h:  # Upscaling
         cropped_image = rescale_i(cropped_image, target_w, target_h, upscale_algorithm)
         cropped_mask = rescale_m(cropped_mask, target_w, target_h, upscale_algorithm)
@@ -448,10 +552,16 @@ def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscal
         cropped_image = rescale_i(cropped_image, target_w, target_h, downscale_algorithm)
         cropped_mask = rescale_m(cropped_mask, target_w, target_h, downscale_algorithm)
 
+    total_time = time.time() - start_time
+    print(f"[DEBUG] crop_magic_im: Total time {total_time:.4f}s")
     return canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h
 
 
 def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm):
+    start_time = time.time()
+    device = canvas_image.device
+    print(f"[DEBUG] stitch_magic_im: Starting stitch operation, device={device}")
+
     canvas_image = canvas_image.clone()
     inpainted_image = inpainted_image.clone()
     mask = mask.clone()
@@ -480,6 +590,8 @@ def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ct
     # Final crop to get back the original image area
     output_image = canvas_image[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w]
 
+    total_time = time.time() - start_time
+    print(f"[DEBUG] stitch_magic_im: Total time {total_time:.4f}s")
     return output_image
 
 
@@ -699,8 +811,18 @@ class InpaintCropImproved:
 
         debug_outputs = {name: [] for name in self.RETURN_NAMES if name.startswith("DEBUG_")}
 
+        # Print GPU info at the start
+        print_gpu_info()
+
         batch_size = image.shape[0]
+        print(f"\n[DEBUG] Starting batch processing: {batch_size} image(s)")
+        print(f"[DEBUG] Image shape: {image.shape}, device: {image.device}")
+        batch_start_time = time.time()
+
         for b in range(batch_size):
+            print(f"\n[DEBUG] ========== Processing image {b+1}/{batch_size} ==========")
+            image_start_time = time.time()
+
             one_image = image[b].unsqueeze(0)
             one_mask = mask[b].unsqueeze(0)
             one_optional_context_mask = optional_context_mask[b].unsqueeze(0)
@@ -728,8 +850,16 @@ class InpaintCropImproved:
                     output_array = output.squeeze(0)  # Assuming output needs to be squeezed similar to image/mask
                     debug_outputs[name].append(output_array)
 
+            image_time = time.time() - image_start_time
+            print(f"[DEBUG] Image {b+1}/{batch_size} completed in {image_time:.4f}s")
+
         result_image = torch.stack(result_image, dim=0)
         result_mask = torch.stack(result_mask, dim=0)
+
+        batch_time = time.time() - batch_start_time
+        print(f"\n[DEBUG] ========== Batch processing complete ==========")
+        print(f"[DEBUG] Total batch time: {batch_time:.4f}s")
+        print(f"[DEBUG] Average time per image: {batch_time/batch_size:.4f}s\n")
 
         if self.DEBUG_MODE:
             print('Inpaint Crop Batch output')
@@ -742,56 +872,79 @@ class InpaintCropImproved:
 
 
     def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask, optional_context_mask):
+        print(f"[DEBUG] inpaint_crop_single_image: Input size {image.shape[2]}x{image.shape[1]}, device={image.device}")
+
         if preresize:
+            print(f"[DEBUG] Step 1: Pre-resizing image...")
+            step_start = time.time()
             image, mask, optional_context_mask = preresize_imm(image, mask, optional_context_mask, downscale_algorithm, upscale_algorithm, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height)
+            print(f"[DEBUG] Step 1 completed in {time.time() - step_start:.4f}s")
         if self.DEBUG_MODE:
             DEBUG_preresize_image = image.clone()
             DEBUG_preresize_mask = mask.clone()
        
         if mask_fill_holes:
-           mask = fillholes_iterative_hipass_fill_m(mask)
+            print(f"[DEBUG] Step 2: Filling holes in mask...")
+            step_start = time.time()
+            mask = fillholes_iterative_hipass_fill_m(mask)
+            print(f"[DEBUG] Step 2 completed in {time.time() - step_start:.4f}s")
         if self.DEBUG_MODE:
             DEBUG_fillholes_mask = mask.clone()
 
         if mask_expand_pixels > 0:
+            print(f"[DEBUG] Step 3: Expanding mask by {mask_expand_pixels} pixels...")
+            step_start = time.time()
             mask = expand_m(mask, mask_expand_pixels)
+            print(f"[DEBUG] Step 3 completed in {time.time() - step_start:.4f}s")
         if self.DEBUG_MODE:
             DEBUG_expand_mask = mask.clone()
 
         if mask_invert:
+            print(f"[DEBUG] Step 4: Inverting mask...")
             mask = invert_m(mask)
         if self.DEBUG_MODE:
             DEBUG_invert_mask = mask.clone()
 
         if mask_blend_pixels > 0:
+            print(f"[DEBUG] Step 5: Creating blend mask (expand + blur)...")
+            step_start = time.time()
             mask = expand_m(mask, mask_blend_pixels)
             mask = blur_m(mask, mask_blend_pixels*0.5)
+            print(f"[DEBUG] Step 5 completed in {time.time() - step_start:.4f}s")
         if self.DEBUG_MODE:
             DEBUG_blur_mask = mask.clone()
 
         if mask_hipass_filter >= 0.01:
+            print(f"[DEBUG] Step 6: Applying hipass filter...")
             mask = hipassfilter_m(mask, mask_hipass_filter)
             optional_context_mask = hipassfilter_m(optional_context_mask, mask_hipass_filter)
         if self.DEBUG_MODE:
             DEBUG_hipassfilter_mask = mask.clone()
 
         if extend_for_outpainting:
+            print(f"[DEBUG] Step 7: Extending image for outpainting...")
+            step_start = time.time()
             image, mask, optional_context_mask = extend_imm(image, mask, optional_context_mask, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor)
+            print(f"[DEBUG] Step 7 completed in {time.time() - step_start:.4f}s")
         if self.DEBUG_MODE:
             DEBUG_extend_image = image.clone()
             DEBUG_extend_mask = mask.clone()
 
+        print(f"[DEBUG] Step 8: Finding context area from mask...")
         context, x, y, w, h = findcontextarea_m(mask)
         # If no mask, mask everything for some inpainting.
         if x == -1 or w == -1 or h == -1 or y == -1:
             x, y, w, h = 0, 0, image.shape[2], image.shape[1]
             context = mask[:, y:y+h, x:x+w]
+        print(f"[DEBUG] Step 8: Found context area at ({x}, {y}) with size {w}x{h}")
         if self.DEBUG_MODE:
             DEBUG_context_from_mask = context.clone()
             DEBUG_context_from_mask_location = debug_context_location_in_image(image, x, y, w, h)
 
         if context_from_mask_extend_factor >= 1.01:
+            print(f"[DEBUG] Step 9: Growing context area by factor {context_from_mask_extend_factor}...")
             context, x, y, w, h = growcontextarea_m(context, mask, x, y, w, h, context_from_mask_extend_factor)
+            print(f"[DEBUG] Step 9: New context area at ({x}, {y}) with size {w}x{h}")
         # If no mask, mask everything for some inpainting.
         if x == -1 or w == -1 or h == -1 or y == -1:
             x, y, w, h = 0, 0, image.shape[2], image.shape[1]
@@ -800,19 +953,24 @@ class InpaintCropImproved:
             DEBUG_context_expand = context.clone()
             DEBUG_context_expand_location = debug_context_location_in_image(image, x, y, w, h)
 
+        print(f"[DEBUG] Step 10: Combining with optional context mask...")
         context, x, y, w, h = combinecontextmask_m(context, mask, x, y, w, h, optional_context_mask)
         # If no mask, mask everything for some inpainting.
         if x == -1 or w == -1 or h == -1 or y == -1:
             x, y, w, h = 0, 0, image.shape[2], image.shape[1]
             context = mask[:, y:y+h, x:x+w]
+        print(f"[DEBUG] Step 10: Final context area at ({x}, {y}) with size {w}x{h}")
         if self.DEBUG_MODE:
             DEBUG_context_with_context_mask = context.clone()
             DEBUG_context_with_context_mask_location = debug_context_location_in_image(image, x, y, w, h)
 
+        print(f"[DEBUG] Step 11: Performing magic crop and resize...")
+        step_start = time.time()
         if not output_resize_to_target_size:
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, w, h, output_padding, downscale_algorithm, upscale_algorithm)
         else: # if output_resize_to_target_size:
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
+        print(f"[DEBUG] Step 11 completed in {time.time() - step_start:.4f}s")
         if self.DEBUG_MODE:
             DEBUG_context_to_target = context.clone()
             DEBUG_context_to_target_location = debug_context_location_in_image(image, x, y, w, h)
@@ -825,9 +983,14 @@ class InpaintCropImproved:
         # For blending, grow the mask even further and make it blurrier.
         cropped_mask_blend = cropped_mask.clone()
         if mask_blend_pixels > 0:
-           cropped_mask_blend = blur_m(cropped_mask_blend, mask_blend_pixels*0.5)
+            print(f"[DEBUG] Step 12: Creating final blend mask...")
+            step_start = time.time()
+            cropped_mask_blend = blur_m(cropped_mask_blend, mask_blend_pixels*0.5)
+            print(f"[DEBUG] Step 12 completed in {time.time() - step_start:.4f}s")
         if self.DEBUG_MODE:
             DEBUG_cropped_mask_blend = cropped_mask_blend.clone()
+
+        print(f"[DEBUG] Single image processing complete. Output size: {cropped_image.shape[2]}x{cropped_image.shape[1]}")
 
         stitcher = {
             'canvas_to_orig_x': cto_x,
