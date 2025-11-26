@@ -1,12 +1,32 @@
 import comfy.utils
+import comfy.model_management
+import folder_paths
 import math
 import nodes
-import numpy as np
 import torch
-import torchvision.transforms.functional as F
-from PIL import Image
-from scipy.ndimage import gaussian_filter, grey_dilation, binary_closing, binary_fill_holes
 import time
+import random
+import os
+from PIL import Image
+import numpy as np
+from scipy.ndimage import gaussian_filter1d, median_filter
+
+
+def gaussian_smooth_1d(values, window_size):
+    """Apply Gaussian smoothing to 1D sequence for crop stabilization"""
+    if len(values) <= 1:
+        return values
+    sigma = window_size / 4.0  # ~95% of weight within window
+    smoothed = gaussian_filter1d(np.array(values, dtype=float), sigma, mode='nearest')
+    return smoothed.tolist()
+
+
+def median_filter_1d(values, window_size):
+    """Apply median filter to 1D sequence for crop stabilization"""
+    if len(values) <= 1:
+        return values
+    filtered = median_filter(np.array(values), size=window_size, mode='nearest')
+    return filtered.tolist()
 
 
 def print_gpu_info():
@@ -34,15 +54,33 @@ def rescale_i(samples, width, height, algorithm: str):
     device = samples.device
     print(f"[DEBUG] rescale_i: Resizing image to {width}x{height} using {algorithm}, device={device}")
 
+    # Map PIL algorithm names to PyTorch modes
+    algorithm_map = {
+        'nearest': 'nearest',
+        'bilinear': 'bilinear',
+        'bicubic': 'bicubic',
+        'lanczos': 'bicubic',  # Lanczos not directly supported, use bicubic
+        'box': 'area',  # Box filter maps to area mode
+        'hamming': 'bilinear',  # Hamming not directly supported, use bilinear
+    }
+
+    mode = algorithm_map.get(algorithm.lower(), 'bilinear')
+
+    # Convert from [B, H, W, C] to [B, C, H, W] for interpolate
     samples = samples.movedim(-1, 1)
-    algorithm = getattr(Image, algorithm.upper())  # i.e. Image.BICUBIC
 
-    cpu_start = time.time()
-    samples_pil: Image.Image = F.to_pil_image(samples[0].cpu()).resize((width, height), algorithm)
-    cpu_time = time.time() - cpu_start
-    print(f"[DEBUG] rescale_i: CPU transfer + PIL resize took {cpu_time:.4f}s")
+    gpu_start = time.time()
+    # Use PyTorch interpolate - stays on GPU
+    samples = torch.nn.functional.interpolate(
+        samples,
+        size=(height, width),
+        mode=mode,
+        align_corners=False if mode in ['bilinear', 'bicubic'] else None
+    )
+    gpu_time = time.time() - gpu_start
+    print(f"[DEBUG] rescale_i: GPU-only resize took {gpu_time:.4f}s (previously CPU)")
 
-    samples = F.to_tensor(samples_pil).unsqueeze(0)
+    # Convert back to [B, H, W, C]
     samples = samples.movedim(1, -1)
 
     total_time = time.time() - start_time
@@ -55,15 +93,33 @@ def rescale_m(samples, width, height, algorithm: str):
     device = samples.device
     print(f"[DEBUG] rescale_m: Resizing mask to {width}x{height} using {algorithm}, device={device}")
 
+    # Map PIL algorithm names to PyTorch modes
+    algorithm_map = {
+        'nearest': 'nearest',
+        'bilinear': 'bilinear',
+        'bicubic': 'bicubic',
+        'lanczos': 'bicubic',  # Lanczos not directly supported, use bicubic
+        'box': 'area',  # Box filter maps to area mode
+        'hamming': 'bilinear',  # Hamming not directly supported, use bilinear
+    }
+
+    mode = algorithm_map.get(algorithm.lower(), 'bilinear')
+
+    # Add channel dimension for interpolate [B, H, W] -> [B, 1, H, W]
     samples = samples.unsqueeze(1)
-    algorithm = getattr(Image, algorithm.upper())  # i.e. Image.BICUBIC
 
-    cpu_start = time.time()
-    samples_pil: Image.Image = F.to_pil_image(samples[0].cpu()).resize((width, height), algorithm)
-    cpu_time = time.time() - cpu_start
-    print(f"[DEBUG] rescale_m: CPU transfer + PIL resize took {cpu_time:.4f}s")
+    gpu_start = time.time()
+    # Use PyTorch interpolate - stays on GPU
+    samples = torch.nn.functional.interpolate(
+        samples,
+        size=(height, width),
+        mode=mode,
+        align_corners=False if mode in ['bilinear', 'bicubic'] else None
+    )
+    gpu_time = time.time() - gpu_start
+    print(f"[DEBUG] rescale_m: GPU-only resize took {gpu_time:.4f}s (previously CPU)")
 
-    samples = F.to_tensor(samples_pil).unsqueeze(0)
+    # Remove channel dimension [B, 1, H, W] -> [B, H, W]
     samples = samples.squeeze(1)
 
     total_time = time.time() - start_time
@@ -148,6 +204,63 @@ def preresize_imm(image, mask, optional_context_mask, downscale_algorithm, upsca
     return image, mask, optional_context_mask
 
 
+def binary_dilation_torch(mask, kernel_size=3):
+    """Perform binary dilation using max pooling."""
+    # Add channel dimension [B, H, W] -> [B, 1, H, W]
+    mask = mask.unsqueeze(1) if mask.dim() == 3 else mask
+    padding = kernel_size // 2
+    dilated = torch.nn.functional.max_pool2d(
+        mask.float(),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding
+    )
+    return dilated.squeeze(1) if dilated.size(1) == 1 else dilated
+
+
+def binary_erosion_torch(mask, kernel_size=3):
+    """Perform binary erosion using negative dilation."""
+    # Erosion = 1 - dilation(1 - mask)
+    inverted = 1.0 - mask
+    dilated = binary_dilation_torch(inverted, kernel_size)
+    eroded = 1.0 - dilated
+    return eroded
+
+
+def binary_closing_torch(mask, kernel_size=3):
+    """Perform binary closing (dilation followed by erosion)."""
+    dilated = binary_dilation_torch(mask, kernel_size)
+    closed = binary_erosion_torch(dilated, kernel_size)
+    return closed
+
+
+def binary_fill_holes_torch(mask):
+    """Fill holes in binary mask using morphological reconstruction.
+    This is a simplified version that works well for most cases."""
+    # Create a seed that is 0 everywhere except the borders (which are inverted from the mask)
+    b, h, w = mask.shape
+    seed = torch.zeros_like(mask)
+
+    # Set borders to inverted mask values
+    seed[:, 0, :] = 1.0 - mask[:, 0, :]
+    seed[:, -1, :] = 1.0 - mask[:, -1, :]
+    seed[:, :, 0] = 1.0 - mask[:, :, 0]
+    seed[:, :, -1] = 1.0 - mask[:, :, -1]
+
+    # Iterative dilation with mask constraint (reconstruction by dilation)
+    for _ in range(max(h, w)):  # Enough iterations to propagate through entire image
+        dilated_seed = binary_dilation_torch(seed, kernel_size=3)
+        # Constrain to inverted mask
+        new_seed = torch.minimum(dilated_seed, 1.0 - mask)
+        if torch.equal(new_seed, seed):
+            break
+        seed = new_seed
+
+    # The filled mask is the original mask OR the inverse of the reconstruction
+    filled = torch.maximum(mask, 1.0 - seed)
+    return filled
+
+
 def fillholes_iterative_hipass_fill_m(samples):
     start_time = time.time()
     device = samples.device
@@ -155,25 +268,32 @@ def fillholes_iterative_hipass_fill_m(samples):
 
     thresholds = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
 
-    cpu_start = time.time()
-    mask_np = samples.squeeze(0).cpu().numpy()
-    cpu_time = time.time() - cpu_start
-    print(f"[DEBUG] fillholes_iterative_hipass_fill_m: GPU->CPU transfer took {cpu_time:.4f}s")
+    # Keep everything on GPU
+    mask = samples.squeeze(0)
+    # Add batch dimension if needed [H, W] -> [1, H, W]
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
 
-    scipy_start = time.time()
+    gpu_start = time.time()
     for threshold in thresholds:
-        thresholded_mask = mask_np >= threshold
-        closed_mask = binary_closing(thresholded_mask, structure=np.ones((3, 3)), border_value=1)
-        filled_mask = binary_fill_holes(closed_mask)
-        mask_np = np.maximum(mask_np, np.where(filled_mask != 0, threshold, 0))
-    scipy_time = time.time() - scipy_start
-    print(f"[DEBUG] fillholes_iterative_hipass_fill_m: Scipy operations (CPU-only) took {scipy_time:.4f}s")
+        # Threshold the mask
+        thresholded_mask = (mask >= threshold).float()
 
-    final_mask = torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(0)
+        # Apply binary closing
+        closed_mask = binary_closing_torch(thresholded_mask, kernel_size=3)
+
+        # Fill holes
+        filled_mask = binary_fill_holes_torch(closed_mask)
+
+        # Update mask with filled values
+        mask = torch.maximum(mask, filled_mask * threshold)
+
+    gpu_time = time.time() - gpu_start
+    print(f"[DEBUG] fillholes_iterative_hipass_fill_m: GPU-only operations took {gpu_time:.4f}s (previously CPU)")
 
     total_time = time.time() - start_time
     print(f"[DEBUG] fillholes_iterative_hipass_fill_m: Total time {total_time:.4f}s")
-    return final_mask
+    return mask.unsqueeze(0) if mask.dim() == 2 else mask
 
 
 def hipassfilter_m(samples, threshold):
@@ -188,26 +308,38 @@ def expand_m(mask, pixels):
     print(f"[DEBUG] expand_m: Expanding mask by {pixels} pixels, device={device}")
 
     sigma = pixels / 4
-
-    cpu_start = time.time()
-    mask_np = mask.squeeze(0).cpu().numpy()
-    cpu_time = time.time() - cpu_start
-    print(f"[DEBUG] expand_m: GPU->CPU transfer took {cpu_time:.4f}s")
-
-    scipy_start = time.time()
     kernel_size = math.ceil(sigma * 1.5 + 1)
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-    dilated_mask = grey_dilation(mask_np, footprint=kernel)
-    dilated_mask = dilated_mask.astype(np.float32)
-    scipy_time = time.time() - scipy_start
-    print(f"[DEBUG] expand_m: Scipy grey_dilation (CPU-only) took {scipy_time:.4f}s")
 
-    dilated_mask = torch.from_numpy(dilated_mask)
+    # Ensure kernel_size is odd
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    gpu_start = time.time()
+
+    # Add channel dimension for max_pool2d [B, H, W] -> [B, 1, H, W]
+    mask = mask.unsqueeze(1)
+
+    # Grey dilation is equivalent to max pooling
+    # Apply max pooling with appropriate padding to expand the mask
+    padding = kernel_size // 2
+    dilated_mask = torch.nn.functional.max_pool2d(
+        mask,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding
+    )
+
+    # Remove channel dimension [B, 1, H, W] -> [B, H, W]
+    dilated_mask = dilated_mask.squeeze(1)
+
+    gpu_time = time.time() - gpu_start
+    print(f"[DEBUG] expand_m: GPU-only max_pool2d (dilation) took {gpu_time:.4f}s (previously CPU)")
+
     dilated_mask = torch.clamp(dilated_mask, 0.0, 1.0)
 
     total_time = time.time() - start_time
     print(f"[DEBUG] expand_m: Total time {total_time:.4f}s")
-    return dilated_mask.unsqueeze(0)
+    return dilated_mask
 
 
 def invert_m(samples):
@@ -221,25 +353,43 @@ def blur_m(samples, pixels):
     device = samples.device
     print(f"[DEBUG] blur_m: Blurring mask with {pixels} pixels, device={device}")
 
-    mask = samples.squeeze(0)
     sigma = pixels / 4
 
-    cpu_start = time.time()
-    mask_np = mask.cpu().numpy()
-    cpu_time = time.time() - cpu_start
-    print(f"[DEBUG] blur_m: GPU->CPU transfer took {cpu_time:.4f}s")
+    # Create Gaussian kernel on GPU
+    kernel_size = int(2 * math.ceil(2 * sigma) + 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
 
-    scipy_start = time.time()
-    blurred_mask = gaussian_filter(mask_np, sigma=sigma)
-    scipy_time = time.time() - scipy_start
-    print(f"[DEBUG] blur_m: Scipy gaussian_filter (CPU-only) took {scipy_time:.4f}s")
+    gpu_start = time.time()
 
-    blurred_mask = torch.from_numpy(blurred_mask).float()
-    blurred_mask = torch.clamp(blurred_mask, 0.0, 1.0)
+    # Generate 1D Gaussian kernel
+    x = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
+    gauss = torch.exp(-x**2 / (2 * sigma**2))
+    gauss = gauss / gauss.sum()
+
+    # Add dimensions for conv2d: [1, 1, kernel_size, 1] and [1, 1, 1, kernel_size]
+    kernel_h = gauss.view(1, 1, kernel_size, 1)
+    kernel_w = gauss.view(1, 1, 1, kernel_size)
+
+    # Add channel dimension for convolution [B, H, W] -> [B, 1, H, W]
+    mask = samples.unsqueeze(1)
+
+    # Apply separable Gaussian blur (horizontal then vertical)
+    padding = kernel_size // 2
+    mask = torch.nn.functional.conv2d(mask, kernel_h, padding=(padding, 0))
+    mask = torch.nn.functional.conv2d(mask, kernel_w, padding=(0, padding))
+
+    # Remove channel dimension [B, 1, H, W] -> [B, H, W]
+    mask = mask.squeeze(1)
+
+    gpu_time = time.time() - gpu_start
+    print(f"[DEBUG] blur_m: GPU-only gaussian blur took {gpu_time:.4f}s (previously CPU)")
+
+    mask = torch.clamp(mask, 0.0, 1.0)
 
     total_time = time.time() - start_time
     print(f"[DEBUG] blur_m: Total time {total_time:.4f}s")
-    return blurred_mask.unsqueeze(0)
+    return mask
 
 
 def extend_imm(image, mask, optional_context_mask, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor):
@@ -401,9 +551,6 @@ def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscal
     print(f"[DEBUG] crop_magic_im: Starting crop operation, device={device}")
     print(f"[DEBUG] crop_magic_im: Context area ({x}, {y}, {w}, {h}), target size {target_w}x{target_h}")
 
-    image = image.clone()
-    mask = mask.clone()
-
     # Ok this is the most complex function in this node. The one that does the magic after all the preparation done by the other nodes.
     # Basically this function determines the right context area that encompasses the whole context area (mask+optional_context_mask),
     # that is ideally within the bounds of the original image, and that has the right aspect ratio to match target width and height.
@@ -562,10 +709,6 @@ def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ct
     device = canvas_image.device
     print(f"[DEBUG] stitch_magic_im: Starting stitch operation, device={device}")
 
-    canvas_image = canvas_image.clone()
-    inpainted_image = inpainted_image.clone()
-    mask = mask.clone()
-
     # Resize inpainted image and mask to match the context size
     _, h, w, _ = inpainted_image.shape
     if ctc_w > w or ctc_h > h:  # Upscaling
@@ -642,6 +785,11 @@ class InpaintCropImproved:
                 # Optional inputs
                 "mask": ("MASK",),
                 "optional_context_mask": ("MASK",),
+
+                # Crop stabilization for video/animation (off by default)
+                "stabilize_crop": ("BOOLEAN", {"default": False, "tooltip": "Enable temporal stabilization of crop coordinates for smoother video/animation results"}),
+                "stabilization_mode": (["smooth", "lock_first", "lock_largest", "median"], {"default": "smooth", "tooltip": "smooth=gaussian blur, lock_first=use first frame size, lock_largest=use max size, median=median filter"}),
+                "smooth_window": ("INT", {"default": 5, "min": 3, "max": 21, "step": 2, "tooltip": "Window size for smoothing (higher=smoother). Only odd numbers."}),
            }
         }
 
@@ -713,13 +861,93 @@ class InpaintCropImproved:
     )
     #'''
 
- 
-    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask=None, optional_context_mask=None):
-        image = image.clone()
-        if mask is not None:
-            mask = mask.clone()
-        if optional_context_mask is not None:
-            optional_context_mask = optional_context_mask.clone()
+    def analyze_batch_coordinates(self, mask_batch):
+        """First pass: extract bounding boxes for all frames for stabilization"""
+        coords = []
+        for b in range(mask_batch.shape[0]):
+            one_mask = mask_batch[b].unsqueeze(0)
+            mask_sum = torch.count_nonzero(one_mask)
+            if mask_sum == 0:
+                coords.append(None)  # Will be skipped
+            else:
+                _, x, y, w, h = findcontextarea_m(one_mask)
+                coords.append({'x': x, 'y': y, 'w': w, 'h': h})
+        return coords
+
+    def stabilize_coordinates(self, coords, mode, window_size):
+        """Apply stabilization to coordinate sequence"""
+        # Filter out None entries (skipped frames)
+        valid_indices = [i for i, c in enumerate(coords) if c is not None]
+
+        if len(valid_indices) <= 1:
+            return coords  # Nothing to stabilize
+
+        if mode == "smooth":
+            # Gaussian smoothing
+            for key in ['x', 'y', 'w', 'h']:
+                values = [coords[i][key] for i in valid_indices]
+                smoothed = gaussian_smooth_1d(values, window_size)
+                for idx, i in enumerate(valid_indices):
+                    coords[i][key] = int(round(smoothed[idx]))
+
+        elif mode == "lock_first":
+            # Use first valid frame's size
+            first = coords[valid_indices[0]]
+            ref_w, ref_h = first['w'], first['h']
+            for i in valid_indices[1:]:
+                # Adjust x, y to center the mask in ref_w x ref_h
+                center_x = coords[i]['x'] + coords[i]['w'] // 2
+                center_y = coords[i]['y'] + coords[i]['h'] // 2
+                coords[i]['w'] = ref_w
+                coords[i]['h'] = ref_h
+                coords[i]['x'] = center_x - ref_w // 2
+                coords[i]['y'] = center_y - ref_h // 2
+
+        elif mode == "lock_largest":
+            # Use max dimensions across all frames
+            max_w = max(coords[i]['w'] for i in valid_indices)
+            max_h = max(coords[i]['h'] for i in valid_indices)
+            for i in valid_indices:
+                center_x = coords[i]['x'] + coords[i]['w'] // 2
+                center_y = coords[i]['y'] + coords[i]['h'] // 2
+                coords[i]['w'] = max_w
+                coords[i]['h'] = max_h
+                coords[i]['x'] = center_x - max_w // 2
+                coords[i]['y'] = center_y - max_h // 2
+
+        elif mode == "median":
+            # Median filter each coordinate
+            for key in ['x', 'y', 'w', 'h']:
+                values = [coords[i][key] for i in valid_indices]
+                filtered = median_filter_1d(values, window_size)
+                for idx, i in enumerate(valid_indices):
+                    coords[i][key] = int(round(filtered[idx]))
+
+        print(f"[DEBUG] Stabilization applied: mode={mode}, window={window_size}, valid_frames={len(valid_indices)}")
+        return coords
+
+    def preprocess_mask_for_stabilization(self, mask, mask_fill_holes, mask_expand_pixels,
+            mask_invert, mask_blend_pixels, mask_hipass_filter):
+        """Run mask preprocessing to extract coordinates for stabilization.
+        Replicates the same preprocessing steps as inpaint_crop_single_image.
+        Returns processed mask without modifying the original."""
+        m = mask.clone()
+
+        if mask_fill_holes:
+            m = fillholes_iterative_hipass_fill_m(m)
+        if mask_expand_pixels > 0:
+            m = expand_m(m, mask_expand_pixels)
+        if mask_invert:
+            m = invert_m(m)
+        if mask_blend_pixels > 0:
+            m = expand_m(m, mask_blend_pixels)
+            m = blur_m(m, mask_blend_pixels * 0.5)
+        if mask_hipass_filter >= 0.01:
+            m = hipassfilter_m(m, mask_hipass_filter)
+
+        return m
+
+    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask=None, optional_context_mask=None, stabilize_crop=False, stabilization_mode="smooth", smooth_window=5):
 
         output_padding = int(output_padding)
         
@@ -804,6 +1032,10 @@ class InpaintCropImproved:
             'cropped_to_canvas_w': [],
             'cropped_to_canvas_h': [],
             'cropped_mask_for_blend': [],
+            # Frame skipping fields
+            'skipped_indices': [],      # List of frame indices that were skipped (no mask)
+            'original_frames': [],      # Original frames for skipped indices
+            'total_frames': 0,          # Total input batch size
         }
         
         result_image = []
@@ -819,6 +1051,41 @@ class InpaintCropImproved:
         print(f"[DEBUG] Image shape: {image.shape}, device: {image.device}")
         batch_start_time = time.time()
 
+        # Stabilization: Two-pass processing when enabled
+        stabilized_coords = None
+        if stabilize_crop and batch_size > 1:
+            print(f"\n[DEBUG] ========== Stabilization Pass ==========")
+            print(f"[DEBUG] Analyzing {batch_size} frames for stabilization (mode={stabilization_mode}, window={smooth_window})...")
+            device = comfy.model_management.get_torch_device()
+
+            # First pass: Preprocess masks and extract coordinates
+            raw_coords = []
+            for b in range(batch_size):
+                one_mask_stab = mask[b].unsqueeze(0).to(device)
+
+                mask_sum = torch.count_nonzero(one_mask_stab)
+                if mask_sum == 0:
+                    raw_coords.append(None)  # Will be skipped
+                    print(f"[DEBUG] Frame {b}: Empty mask (will skip)")
+                else:
+                    # Preprocess mask (same steps as in inpaint_crop_single_image)
+                    processed = self.preprocess_mask_for_stabilization(
+                        one_mask_stab, mask_fill_holes, mask_expand_pixels,
+                        mask_invert, mask_blend_pixels, mask_hipass_filter)
+                    _, x, y, w, h = findcontextarea_m(processed)
+                    raw_coords.append({'x': x, 'y': y, 'w': w, 'h': h})
+                    print(f"[DEBUG] Frame {b}: Raw coords ({x}, {y}, {w}x{h})")
+
+            # Apply stabilization
+            stabilized_coords = self.stabilize_coordinates(raw_coords, stabilization_mode, smooth_window)
+
+            # Print stabilized coords for comparison
+            for b, coord in enumerate(stabilized_coords):
+                if coord is not None:
+                    print(f"[DEBUG] Frame {b}: Stabilized coords ({coord['x']}, {coord['y']}, {coord['w']}x{coord['h']})")
+
+            print(f"[DEBUG] ========== Stabilization Pass Complete ==========\n")
+
         for b in range(batch_size):
             print(f"\n[DEBUG] ========== Processing image {b+1}/{batch_size} ==========")
             image_start_time = time.time()
@@ -827,21 +1094,34 @@ class InpaintCropImproved:
             one_mask = mask[b].unsqueeze(0)
             one_optional_context_mask = optional_context_mask[b].unsqueeze(0)
 
+            # Check if mask is empty BEFORE processing - skip frames without masks
+            mask_sum = torch.count_nonzero(one_mask)
+            if mask_sum == 0:
+                print(f"[DEBUG] Frame {b}: No mask detected - SKIPPING (will use original in output)")
+                result_stitcher['skipped_indices'].append(b)
+                result_stitcher['original_frames'].append(one_image.squeeze(0))
+                continue  # Skip this frame entirely
+
+            # Get stabilized coords for this frame (if stabilization enabled)
+            frame_stabilized_coords = None
+            if stabilized_coords is not None and b < len(stabilized_coords):
+                frame_stabilized_coords = stabilized_coords[b]
+
             outputs = self.inpaint_crop_single_image(
                 one_image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode,
                 preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height,
                 extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor,
                 mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels,
                 context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height,
-                output_padding, one_mask, one_optional_context_mask)
+                output_padding, one_mask, one_optional_context_mask, frame_stabilized_coords)
 
             stitcher, cropped_image, cropped_mask = outputs[:3]
             for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
                 result_stitcher[key].append(stitcher[key])
 
-            cropped_image = cropped_image.clone().squeeze(0)
+            cropped_image = cropped_image.squeeze(0)
             result_image.append(cropped_image)
-            cropped_mask = cropped_mask.clone().squeeze(0)
+            cropped_mask = cropped_mask.squeeze(0)
             result_mask.append(cropped_mask)
 
             # Handle the DEBUG_ fields dynamically
@@ -853,8 +1133,20 @@ class InpaintCropImproved:
             image_time = time.time() - image_start_time
             print(f"[DEBUG] Image {b+1}/{batch_size} completed in {image_time:.4f}s")
 
-        result_image = torch.stack(result_image, dim=0)
-        result_mask = torch.stack(result_mask, dim=0)
+        # Store total frames for reconstruction in stitch
+        result_stitcher['total_frames'] = batch_size
+
+        # Handle edge case: ALL frames were skipped (no masks in any frame)
+        if len(result_image) == 0:
+            print(f"[DEBUG] WARNING: All {batch_size} frames skipped (no masks detected in any frame)")
+            print(f"[DEBUG] Returning original images unchanged")
+            # Return original images with empty masks - stitch will pass them through
+            result_image = image
+            result_mask = torch.zeros((batch_size, image.shape[1], image.shape[2]), device=image.device)
+        else:
+            result_image = torch.stack(result_image, dim=0)
+            result_mask = torch.stack(result_mask, dim=0)
+            print(f"[DEBUG] Processed {len(result_image)} frames, skipped {len(result_stitcher['skipped_indices'])} frames")
 
         batch_time = time.time() - batch_start_time
         print(f"\n[DEBUG] ========== Batch processing complete ==========")
@@ -871,7 +1163,12 @@ class InpaintCropImproved:
         return result_stitcher, result_image, result_mask, *[debug_outputs[name] for name in self.RETURN_NAMES if name.startswith("DEBUG_")]
 
 
-    def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask, optional_context_mask):
+    def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask, optional_context_mask, stabilized_coords=None):
+        # Move tensors to GPU for processing
+        device = comfy.model_management.get_torch_device()
+        image = image.to(device)
+        mask = mask.to(device)
+        optional_context_mask = optional_context_mask.to(device)
         print(f"[DEBUG] inpaint_crop_single_image: Input size {image.shape[2]}x{image.shape[1]}, device={image.device}")
 
         if preresize:
@@ -931,12 +1228,27 @@ class InpaintCropImproved:
             DEBUG_extend_mask = mask.clone()
 
         print(f"[DEBUG] Step 8: Finding context area from mask...")
-        context, x, y, w, h = findcontextarea_m(mask)
-        # If no mask, mask everything for some inpainting.
-        if x == -1 or w == -1 or h == -1 or y == -1:
-            x, y, w, h = 0, 0, image.shape[2], image.shape[1]
+        if stabilized_coords is not None:
+            # Use pre-computed stabilized coordinates
+            x, y = stabilized_coords['x'], stabilized_coords['y']
+            w, h = stabilized_coords['w'], stabilized_coords['h']
+
+            # Bounds checking to prevent out-of-bounds access
+            img_h, img_w = mask.shape[1], mask.shape[2]
+            x = max(0, min(x, img_w - 1))
+            y = max(0, min(y, img_h - 1))
+            w = max(1, min(w, img_w - x))
+            h = max(1, min(h, img_h - y))
+
             context = mask[:, y:y+h, x:x+w]
-        print(f"[DEBUG] Step 8: Found context area at ({x}, {y}) with size {w}x{h}")
+            print(f"[DEBUG] Step 8: Using STABILIZED context area at ({x}, {y}) with size {w}x{h}")
+        else:
+            context, x, y, w, h = findcontextarea_m(mask)
+            # If no mask, mask everything for some inpainting.
+            if x == -1 or w == -1 or h == -1 or y == -1:
+                x, y, w, h = 0, 0, image.shape[2], image.shape[1]
+                context = mask[:, y:y+h, x:x+w]
+            print(f"[DEBUG] Step 8: Found context area at ({x}, {y}) with size {w}x{h}")
         if self.DEBUG_MODE:
             DEBUG_context_from_mask = context.clone()
             DEBUG_context_from_mask_location = debug_context_location_in_image(image, x, y, w, h)
@@ -992,6 +1304,13 @@ class InpaintCropImproved:
 
         print(f"[DEBUG] Single image processing complete. Output size: {cropped_image.shape[2]}x{cropped_image.shape[1]}")
 
+        # Move results back to intermediate device (CPU by default)
+        intermediate = comfy.model_management.intermediate_device()
+        cropped_image = cropped_image.to(intermediate)
+        cropped_mask = cropped_mask.to(intermediate)
+        canvas_image = canvas_image.to(intermediate)
+        cropped_mask_blend = cropped_mask_blend.to(intermediate)
+
         stitcher = {
             'canvas_to_orig_x': cto_x,
             'canvas_to_orig_y': cto_y,
@@ -1039,38 +1358,71 @@ class InpaintStitchImproved:
 
 
     def inpaint_stitch(self, stitcher, inpainted_image):
-        inpainted_image = inpainted_image.clone()
         results = []
 
-        batch_size = inpainted_image.shape[0]
-        assert len(stitcher['cropped_to_canvas_x']) == batch_size or len(stitcher['cropped_to_canvas_x']) == 1, "Stitch batch size doesn't match image batch size"
-        override = False
-        if len(stitcher['cropped_to_canvas_x']) != batch_size and len(stitcher['cropped_to_canvas_x']) == 1:
-            override = True
-        for b in range(batch_size):
-            one_image = inpainted_image[b]
-            one_stitcher = {}
-            for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']:
-                one_stitcher[key] = stitcher[key]
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
-                if override: # One stitcher for many images, always read 0.
-                    one_stitcher[key] = stitcher[key][0]
+        # Get frame skipping info
+        skipped_indices = set(stitcher.get('skipped_indices', []))
+        original_frames = stitcher.get('original_frames', [])
+        total_frames = stitcher.get('total_frames', inpainted_image.shape[0])
+
+        # If no frames were skipped, use original logic
+        if len(skipped_indices) == 0:
+            batch_size = inpainted_image.shape[0]
+            assert len(stitcher['cropped_to_canvas_x']) == batch_size or len(stitcher['cropped_to_canvas_x']) == 1, "Stitch batch size doesn't match image batch size"
+            override = False
+            if len(stitcher['cropped_to_canvas_x']) != batch_size and len(stitcher['cropped_to_canvas_x']) == 1:
+                override = True
+            for b in range(batch_size):
+                one_image = inpainted_image[b]
+                one_stitcher = {}
+                for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']:
+                    one_stitcher[key] = stitcher[key]
+                for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
+                    if override: # One stitcher for many images, always read 0.
+                        one_stitcher[key] = stitcher[key][0]
+                    else:
+                        one_stitcher[key] = stitcher[key][b]
+                one_image = one_image.unsqueeze(0)
+                one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image)
+                one_image = one_image.squeeze(0)
+                results.append(one_image)
+        else:
+            # Reconstruct full batch with skipped frames inserted
+            print(f"[DEBUG] Stitch: Reconstructing {total_frames} frames ({len(skipped_indices)} skipped, {inpainted_image.shape[0]} inpainted)")
+            inpainted_idx = 0
+            original_idx = 0
+
+            for frame_idx in range(total_frames):
+                if frame_idx in skipped_indices:
+                    # Use original frame (no inpainting needed)
+                    print(f"[DEBUG] Frame {frame_idx}: Using original (was skipped)")
+                    results.append(original_frames[original_idx])
+                    original_idx += 1
                 else:
-                    one_stitcher[key] = stitcher[key][b]
-            one_image = one_image.unsqueeze(0)
-            one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image)
-            one_image = one_image.squeeze(0)
-            one_image = one_image.clone()
-            results.append(one_image)
+                    # Stitch inpainted frame
+                    one_image = inpainted_image[inpainted_idx]
+                    one_stitcher = {}
+                    for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']:
+                        one_stitcher[key] = stitcher[key]
+                    for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
+                        one_stitcher[key] = stitcher[key][inpainted_idx]
+                    one_image = one_image.unsqueeze(0)
+                    one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image)
+                    one_image = one_image.squeeze(0)
+                    results.append(one_image)
+                    inpainted_idx += 1
 
         result_batch = torch.stack(results, dim=0)
 
         return (result_batch,)
 
     def inpaint_stitch_single_image(self, stitcher, inpainted_image):
+        # Move tensors to GPU for processing
+        device = comfy.model_management.get_torch_device()
+
         downscale_algorithm = stitcher['downscale_algorithm']
         upscale_algorithm = stitcher['upscale_algorithm']
-        canvas_image = stitcher['canvas_image']
+        canvas_image = stitcher['canvas_image'].to(device)
 
         ctc_x = stitcher['cropped_to_canvas_x']
         ctc_y = stitcher['cropped_to_canvas_y']
@@ -1082,8 +1434,370 @@ class InpaintStitchImproved:
         cto_w = stitcher['canvas_to_orig_w']
         cto_h = stitcher['canvas_to_orig_h']
 
-        mask = stitcher['cropped_mask_for_blend']  # shape: [1, H, W]
+        mask = stitcher['cropped_mask_for_blend'].to(device)  # shape: [1, H, W]
+        inpainted_image = inpainted_image.to(device)
 
         output_image = stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm)
 
+        # Move result back to intermediate device (CPU by default)
+        output_image = output_image.to(comfy.model_management.intermediate_device())
+
         return (output_image,)
+
+
+class StitcherDebugInfo:
+    """
+    Debug node that displays stitcher metadata as JSON text.
+    Useful for debugging and understanding what the crop node captured.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+            }
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "preview"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Display stitcher metadata (frame counts, coordinates, skipped frames)"
+
+    def preview(self, stitcher):
+        import json
+
+        batch_size = len(stitcher.get('canvas_to_orig_x', []))
+        total_frames = stitcher.get('total_frames', batch_size)
+        skipped_indices = stitcher.get('skipped_indices', [])
+
+        info = {
+            "total_input_frames": total_frames,
+            "processed_frames": batch_size,
+            "skipped_frames_count": len(skipped_indices),
+            "skipped_frame_indices": skipped_indices,
+            "algorithms": {
+                "downscale": stitcher.get('downscale_algorithm'),
+                "upscale": stitcher.get('upscale_algorithm'),
+            },
+            "blend_pixels": stitcher.get('blend_pixels'),
+            "frames": []
+        }
+
+        for i in range(batch_size):
+            canvas_img = stitcher['canvas_image'][i]
+            canvas_shape = list(canvas_img.shape) if hasattr(canvas_img, 'shape') else "N/A"
+
+            frame_info = {
+                "frame_index": i,
+                "canvas_to_orig": {
+                    "x": stitcher['canvas_to_orig_x'][i],
+                    "y": stitcher['canvas_to_orig_y'][i],
+                    "w": stitcher['canvas_to_orig_w'][i],
+                    "h": stitcher['canvas_to_orig_h'][i],
+                },
+                "crop_to_canvas": {
+                    "x": stitcher['cropped_to_canvas_x'][i],
+                    "y": stitcher['cropped_to_canvas_y'][i],
+                    "w": stitcher['cropped_to_canvas_w'][i],
+                    "h": stitcher['cropped_to_canvas_h'][i],
+                },
+                "canvas_shape": canvas_shape,
+            }
+            info["frames"].append(frame_info)
+
+        text = json.dumps(info, indent=2)
+
+        return {"ui": {"text": (text,)}}
+
+
+class StitcherDebugImages:
+    """
+    Extract canvas images and masks from stitcher for workflow use and visualization.
+    Returns canvas images, mask overlay visualization, and raw masks.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+            },
+            "optional": {
+                "mask_overlay_opacity": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
+                "mask_color": (["red", "green", "blue", "yellow", "magenta", "cyan"], {"default": "red"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
+    RETURN_NAMES = ("canvas_images", "canvas_with_mask_overlay", "masks")
+    FUNCTION = "get_images"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Extract canvas images and masks from stitcher with optional mask visualization overlay"
+
+    def get_images(self, stitcher, mask_overlay_opacity=0.5, mask_color="red"):
+        canvas_images = stitcher.get('canvas_image', [])
+        blend_masks = stitcher.get('cropped_mask_for_blend', [])
+
+        if not canvas_images or len(canvas_images) == 0:
+            empty_img = torch.zeros(1, 1, 1, 3)
+            empty_mask = torch.zeros(1, 1, 1)
+            return (empty_img, empty_img, empty_mask)
+
+        # Process canvas images - squeeze extra batch dimensions
+        images = []
+        for canvas_img in canvas_images:
+            img = canvas_img
+            while img.dim() > 3:
+                img = img.squeeze(0)
+            images.append(img)
+
+        canvas_batch = torch.stack(images, dim=0)  # [B, H, W, C]
+
+        # Process masks and place them on canvas-sized masks using crop coordinates
+        # The cropped_mask_for_blend is at crop resolution, need to place it on canvas
+        canvas_masks = []
+        for i, mask in enumerate(blend_masks):
+            m = mask
+            while m.dim() > 2:
+                m = m.squeeze(0)
+
+            # Get canvas dimensions from the processed canvas image
+            canvas_h, canvas_w = images[i].shape[0], images[i].shape[1]
+
+            # Get placement coordinates (where crop goes on canvas)
+            ctc_x = stitcher['cropped_to_canvas_x'][i]
+            ctc_y = stitcher['cropped_to_canvas_y'][i]
+            ctc_w = stitcher['cropped_to_canvas_w'][i]
+            ctc_h = stitcher['cropped_to_canvas_h'][i]
+
+            # Create full canvas-sized mask
+            full_mask = torch.zeros(canvas_h, canvas_w, device=m.device, dtype=m.dtype)
+
+            # Resize cropped mask to target size and place on canvas
+            m_resized = torch.nn.functional.interpolate(
+                m.unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+                size=(ctc_h, ctc_w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0).squeeze(0)  # back to [H, W]
+
+            # Place resized mask on canvas at correct position
+            full_mask[ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w] = m_resized
+
+            canvas_masks.append(full_mask)
+
+        mask_batch = torch.stack(canvas_masks, dim=0)  # [B, H, W]
+
+        # Create overlay visualization (canvas with colored mask area)
+        color_map = {
+            "red": [1.0, 0.0, 0.0],
+            "green": [0.0, 1.0, 0.0],
+            "blue": [0.0, 0.0, 1.0],
+            "yellow": [1.0, 1.0, 0.0],
+            "magenta": [1.0, 0.0, 1.0],
+            "cyan": [0.0, 1.0, 1.0],
+        }
+        color = torch.tensor(color_map[mask_color], device=canvas_batch.device)
+
+        overlay_batch = canvas_batch.clone()
+        mask_expanded = mask_batch.unsqueeze(-1).to(canvas_batch.device)  # [B, H, W, 1]
+        color_layer = color.view(1, 1, 1, 3).expand_as(overlay_batch)
+
+        # Blend: original * (1 - mask*opacity) + color * mask * opacity
+        overlay_batch = overlay_batch * (1 - mask_expanded * mask_overlay_opacity) + \
+                        color_layer * mask_expanded * mask_overlay_opacity
+
+        return (canvas_batch, overlay_batch, mask_batch)
+
+
+def expand_stitcher_metadata(stitcher, factor, interpolated_indices):
+    """Expand stitcher lists to match new frame count after temporal expansion"""
+    expanded = {
+        'downscale_algorithm': stitcher['downscale_algorithm'],
+        'upscale_algorithm': stitcher['upscale_algorithm'],
+        'blend_pixels': stitcher['blend_pixels'],
+        'skipped_indices': [],
+        'original_frames': [],
+        'total_frames': 0,
+        'interpolated_indices': interpolated_indices,  # Track which frames are interpolated
+        'original_frame_count': len(stitcher['canvas_to_orig_x']),  # Original count before expansion
+    }
+
+    # Expand per-frame lists
+    list_keys = ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h',
+                 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y',
+                 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']
+
+    for key in list_keys:
+        expanded[key] = []
+        original_list = stitcher[key]
+
+        for i in range(len(original_list) - 1):
+            # Add original frame data
+            expanded[key].append(original_list[i])
+            # Add interpolated frame copies (use data from frame i for stitching)
+            for _ in range(factor - 1):
+                if key == 'canvas_image':
+                    # For canvas images, use the original (interpolation happens on cropped)
+                    expanded[key].append(original_list[i])
+                elif key == 'cropped_mask_for_blend':
+                    # For blend masks, use the original
+                    expanded[key].append(original_list[i])
+                else:
+                    # Numeric values - copy from previous frame
+                    expanded[key].append(original_list[i])
+
+        # Add final frame
+        expanded[key].append(original_list[-1])
+
+    expanded['total_frames'] = len(expanded['canvas_to_orig_x'])
+    return expanded
+
+
+def collapse_stitcher_metadata(stitcher, keep_indices):
+    """Collapse stitcher lists back to original frame count"""
+    collapsed = {
+        'downscale_algorithm': stitcher['downscale_algorithm'],
+        'upscale_algorithm': stitcher['upscale_algorithm'],
+        'blend_pixels': stitcher['blend_pixels'],
+        'skipped_indices': stitcher.get('skipped_indices', []),
+        'original_frames': stitcher.get('original_frames', []),
+        'total_frames': len(keep_indices),
+    }
+
+    list_keys = ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h',
+                 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y',
+                 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']
+
+    for key in list_keys:
+        original_list = stitcher[key]
+        collapsed[key] = [original_list[i] for i in keep_indices]
+
+    return collapsed
+
+
+class TemporalExpand:
+    """
+    Expands frame count by inserting interpolated frames between originals.
+    Works with STITCHER to maintain crop/stitch compatibility.
+    Use this to "slow down" motion before inpainting for better results.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+                "images": ("IMAGE",),
+                "masks": ("MASK",),
+            },
+            "optional": {
+                "expansion_factor": (["2x", "3x", "4x"], {"default": "2x", "tooltip": "How many frames to create. 2x inserts 1 frame between each pair."}),
+                "interpolation_mode": (["linear", "nearest"], {"default": "linear", "tooltip": "linear=blend frames, nearest=duplicate frames"}),
+            }
+        }
+
+    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK")
+    RETURN_NAMES = ("expanded_stitcher", "expanded_images", "expanded_masks")
+    FUNCTION = "expand"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Insert interpolated frames between originals for smoother inpainting"
+
+    def expand(self, stitcher, images, masks, expansion_factor="2x", interpolation_mode="linear"):
+        factor = {"2x": 2, "3x": 3, "4x": 4}[expansion_factor]
+        batch_size = images.shape[0]
+
+        print(f"[DEBUG] TemporalExpand: {batch_size} frames → {expansion_factor} expansion ({interpolation_mode} mode)")
+
+        if batch_size < 2:
+            # Single frame, nothing to expand
+            print(f"[DEBUG] TemporalExpand: Only 1 frame, skipping expansion")
+            return (stitcher, images, masks)
+
+        expanded_images = []
+        expanded_masks = []
+        interpolated_indices = []  # Track which frames are interpolated
+
+        for i in range(batch_size - 1):
+            frame_a = images[i]
+            frame_b = images[i + 1]
+            mask_a = masks[i]
+            mask_b = masks[i + 1]
+
+            # Add original frame
+            expanded_images.append(frame_a)
+            expanded_masks.append(mask_a)
+
+            # Add interpolated frames
+            for j in range(1, factor):
+                alpha = j / factor
+                if interpolation_mode == "linear":
+                    interp_frame = frame_a * (1 - alpha) + frame_b * alpha
+                    interp_mask = mask_a * (1 - alpha) + mask_b * alpha
+                else:  # nearest
+                    interp_frame = frame_a if alpha < 0.5 else frame_b
+                    interp_mask = mask_a if alpha < 0.5 else mask_b
+
+                expanded_images.append(interp_frame)
+                expanded_masks.append(interp_mask)
+                interpolated_indices.append(len(expanded_images) - 1)
+
+        # Add final frame
+        expanded_images.append(images[-1])
+        expanded_masks.append(masks[-1])
+
+        # Stack results
+        expanded_images = torch.stack(expanded_images, dim=0)
+        expanded_masks = torch.stack(expanded_masks, dim=0)
+
+        # Expand stitcher metadata
+        expanded_stitcher = expand_stitcher_metadata(stitcher, factor, interpolated_indices)
+
+        print(f"[DEBUG] TemporalExpand: Expanded {batch_size} → {expanded_images.shape[0]} frames")
+        print(f"[DEBUG] TemporalExpand: {len(interpolated_indices)} interpolated frames at indices: {interpolated_indices[:10]}{'...' if len(interpolated_indices) > 10 else ''}")
+
+        return (expanded_stitcher, expanded_images, expanded_masks)
+
+
+class TemporalCollapse:
+    """
+    Removes interpolated frames to restore original frame count.
+    Uses indices from TemporalExpand to know which frames to keep.
+    Use after inpainting to get back to original frame count.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+                "images": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("STITCHER", "IMAGE")
+    RETURN_NAMES = ("collapsed_stitcher", "collapsed_images")
+    FUNCTION = "collapse"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Remove interpolated frames to restore original frame count"
+
+    def collapse(self, stitcher, images):
+        interpolated_indices = set(stitcher.get('interpolated_indices', []))
+        original_count = stitcher.get('original_frame_count', images.shape[0])
+
+        print(f"[DEBUG] TemporalCollapse: {images.shape[0]} frames, {len(interpolated_indices)} interpolated")
+
+        if not interpolated_indices:
+            # No interpolation was done
+            print(f"[DEBUG] TemporalCollapse: No interpolated frames found, returning unchanged")
+            return (stitcher, images)
+
+        # Keep only non-interpolated frames
+        keep_indices = [i for i in range(images.shape[0]) if i not in interpolated_indices]
+        collapsed_images = images[keep_indices]
+
+        # Collapse stitcher metadata
+        collapsed_stitcher = collapse_stitcher_metadata(stitcher, keep_indices)
+
+        print(f"[DEBUG] TemporalCollapse: Collapsed {images.shape[0]} → {collapsed_images.shape[0]} frames")
+        print(f"[DEBUG] TemporalCollapse: Kept indices: {keep_indices[:10]}{'...' if len(keep_indices) > 10 else ''}")
+
+        return (collapsed_stitcher, collapsed_images)
