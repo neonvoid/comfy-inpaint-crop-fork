@@ -854,6 +854,83 @@ def analyze_and_track_masks(mask_batch, min_size=500, max_dist=150, threshold=0.
     return tracked_masks, tracking_info
 
 
+def limit_regions_per_frame(mask_batch, max_regions=4, batch_index=0, min_size=500, mode="largest"):
+    """
+    For each frame, detect connected regions and keep only the selected batch.
+
+    Args:
+        mask_batch: Tensor [B, H, W] - batch of masks
+        max_regions: Maximum regions to keep per frame
+        batch_index: Which batch of regions (0=first N, 1=next N, etc.)
+        min_size: Minimum pixel count to consider a region
+        mode: Selection mode - "largest", "smallest", "leftmost", "rightmost"
+
+    Returns:
+        output_masks: Tensor [B, H, W] with only selected regions (binary)
+        max_batches: Maximum batches needed to cover all regions
+        regions_per_frame: List of region counts per frame
+    """
+    start_time = time.time()
+    device = mask_batch.device
+    B, H, W = mask_batch.shape
+
+    print(f"[DEBUG] limit_regions_per_frame: Processing {B} frames, max_regions={max_regions}, batch_index={batch_index}, mode={mode}")
+
+    output_masks = torch.zeros_like(mask_batch)
+    max_regions_in_any_frame = 0
+    regions_per_frame = []
+
+    for frame_idx in range(B):
+        binary = (mask_batch[frame_idx] > 0.5).cpu().numpy()
+        labeled, num_features = scipy_label(binary)
+
+        # Extract regions with properties
+        regions = []
+        for i in range(1, num_features + 1):
+            region_mask = (labeled == i)
+            area = region_mask.sum()
+            if area >= min_size:
+                ys, xs = np.where(region_mask)
+                regions.append({
+                    'mask': region_mask,
+                    'area': int(area),
+                    'center_x': float(xs.mean()),
+                    'center_y': float(ys.mean())
+                })
+
+        regions_per_frame.append(len(regions))
+        max_regions_in_any_frame = max(max_regions_in_any_frame, len(regions))
+
+        # Sort by selection mode
+        if mode == "largest":
+            regions.sort(key=lambda r: r['area'], reverse=True)
+        elif mode == "smallest":
+            regions.sort(key=lambda r: r['area'])
+        elif mode == "leftmost":
+            regions.sort(key=lambda r: r['center_x'])
+        elif mode == "rightmost":
+            regions.sort(key=lambda r: r['center_x'], reverse=True)
+
+        # Select batch
+        start_idx = batch_index * max_regions
+        end_idx = start_idx + max_regions
+        selected = regions[start_idx:end_idx]
+
+        # Build output mask
+        frame_output = np.zeros((H, W), dtype=np.float32)
+        for region in selected:
+            frame_output[region['mask']] = 1.0
+
+        output_masks[frame_idx] = torch.from_numpy(frame_output).to(device)
+
+    max_batches = (max_regions_in_any_frame + max_regions - 1) // max_regions if max_regions_in_any_frame > 0 else 1
+
+    elapsed = time.time() - start_time
+    print(f"[DEBUG] limit_regions_per_frame: Max {max_regions_in_any_frame} regions in any frame, {max_batches} batches needed, took {elapsed:.4f}s")
+
+    return output_masks, max_batches, regions_per_frame
+
+
 class InpaintCropImproved:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2100,3 +2177,57 @@ class MaskColorizer:
         print(f"[DEBUG] MaskColorizer: Created colored visualization {colored_image.shape}")
 
         return (colored_image,)
+
+
+class MaskRegionLimiter:
+    """
+    Per-frame region limiter: selects up to N regions per frame based on size/position.
+    Use multiple passes with different batch_index values to process all regions.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "max_regions": ("INT", {"default": 4, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "Maximum regions to keep per frame"}),
+                "batch_index": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1,
+                    "tooltip": "Which batch of regions (0=first N, 1=next N, etc.)"}),
+                "min_region_size": ("INT", {"default": 500, "min": 1, "max": 100000, "step": 1,
+                    "tooltip": "Minimum pixel count for a region to be considered"}),
+                "selection_mode": (["largest", "smallest", "leftmost", "rightmost"], {"default": "largest",
+                    "tooltip": "How to order regions for selection"}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "INT", "STRING")
+    RETURN_NAMES = ("filtered_mask", "max_batches_needed", "regions_info")
+    FUNCTION = "limit_regions"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Limit mask to N regions per frame. Use batch_index to process remaining regions in additional passes."
+
+    def limit_regions(self, mask, max_regions, batch_index, min_region_size, selection_mode):
+        print(f"[DEBUG] MaskRegionLimiter: Input mask shape {mask.shape}")
+
+        filtered_mask, max_batches, regions_per_frame = limit_regions_per_frame(
+            mask,
+            max_regions=max_regions,
+            batch_index=batch_index,
+            min_size=min_region_size,
+            mode=selection_mode
+        )
+
+        # Build info string
+        non_empty_frames = sum(1 for r in regions_per_frame if r > 0)
+        info = {
+            "batch_index": batch_index,
+            "max_batches_needed": max_batches,
+            "total_frames": len(regions_per_frame),
+            "frames_with_regions": non_empty_frames,
+            "max_regions_in_frame": max(regions_per_frame) if regions_per_frame else 0,
+        }
+        regions_info = json.dumps(info, indent=2)
+
+        print(f"[DEBUG] MaskRegionLimiter: Output - batch {batch_index}/{max_batches}, {non_empty_frames} frames with regions")
+
+        return (filtered_mask, max_batches, regions_info)

@@ -7,6 +7,7 @@ from .inpaint_cropandstitch import TemporalCollapse
 from .inpaint_cropandstitch import MaskRegionAnalyzer
 from .inpaint_cropandstitch import MaskPlayerFilter
 from .inpaint_cropandstitch import MaskColorizer
+from .inpaint_cropandstitch import MaskRegionLimiter
 
 # OLD
 from .inpaint_cropandstitch_old import InpaintCrop
@@ -26,6 +27,7 @@ NODE_CLASS_MAPPINGS = {
     "NV_MaskRegionAnalyzer": MaskRegionAnalyzer,
     "NV_MaskPlayerFilter": MaskPlayerFilter,
     "NV_MaskColorizer": MaskColorizer,
+    "NV_MaskRegionLimiter": MaskRegionLimiter,
 
     # OLD (deprecated)
     "InpaintCrop": InpaintCrop,
@@ -44,6 +46,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_MaskRegionAnalyzer": "NV ✂️ Mask Region Analyzer",
     "NV_MaskPlayerFilter": "NV ✂️ Mask Player Filter",
     "NV_MaskColorizer": "NV ✂️ Mask Colorizer",
+    "NV_MaskRegionLimiter": "NV ✂️ Mask Region Limiter",
 
     # OLD (deprecated)
     "InpaintCrop": "(OLD 💀) Inpaint Crop",
