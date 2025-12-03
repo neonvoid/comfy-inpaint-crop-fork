@@ -4,6 +4,9 @@ from .inpaint_cropandstitch import StitcherDebugInfo
 from .inpaint_cropandstitch import StitcherDebugImages
 from .inpaint_cropandstitch import TemporalExpand
 from .inpaint_cropandstitch import TemporalCollapse
+from .inpaint_cropandstitch import MaskRegionAnalyzer
+from .inpaint_cropandstitch import MaskPlayerFilter
+from .inpaint_cropandstitch import MaskColorizer
 
 # OLD
 from .inpaint_cropandstitch_old import InpaintCrop
@@ -20,6 +23,9 @@ NODE_CLASS_MAPPINGS = {
     "NV_StitcherDebugImages": StitcherDebugImages,
     "NV_TemporalExpand": TemporalExpand,
     "NV_TemporalCollapse": TemporalCollapse,
+    "NV_MaskRegionAnalyzer": MaskRegionAnalyzer,
+    "NV_MaskPlayerFilter": MaskPlayerFilter,
+    "NV_MaskColorizer": MaskColorizer,
 
     # OLD (deprecated)
     "InpaintCrop": InpaintCrop,
@@ -35,6 +41,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NV_StitcherDebugImages": "NV ✂️ Stitcher Debug Images",
     "NV_TemporalExpand": "NV ✂️ Temporal Expand",
     "NV_TemporalCollapse": "NV ✂️ Temporal Collapse",
+    "NV_MaskRegionAnalyzer": "NV ✂️ Mask Region Analyzer",
+    "NV_MaskPlayerFilter": "NV ✂️ Mask Player Filter",
+    "NV_MaskColorizer": "NV ✂️ Mask Colorizer",
 
     # OLD (deprecated)
     "InpaintCrop": "(OLD 💀) Inpaint Crop",

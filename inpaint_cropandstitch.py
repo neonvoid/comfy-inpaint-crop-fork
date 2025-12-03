@@ -9,7 +9,9 @@ import random
 import os
 from PIL import Image
 import numpy as np
-from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.ndimage import gaussian_filter1d, median_filter, label as scipy_label
+from scipy.optimize import linear_sum_assignment
+import json
 
 
 def gaussian_smooth_1d(values, window_size):
@@ -736,6 +738,120 @@ def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ct
     total_time = time.time() - start_time
     print(f"[DEBUG] stitch_magic_im: Total time {total_time:.4f}s")
     return output_image
+
+
+def analyze_and_track_masks(mask_batch, min_size=500, max_dist=150, threshold=0.5):
+    """
+    Analyze mask batch: detect connected regions, track across frames, assign persistent IDs.
+
+    Args:
+        mask_batch: Tensor [B, H, W] - batch of masks
+        min_size: Minimum pixel count to consider a region (filter noise)
+        max_dist: Maximum centroid distance for tracking between frames
+        threshold: Binarization threshold for mask
+
+    Returns:
+        tracked_masks: Tensor [B, H, W] with persistent player IDs as values
+        tracking_info: Dict with tracking statistics
+    """
+    start_time = time.time()
+    device = mask_batch.device
+    B, H, W = mask_batch.shape
+
+    print(f"[DEBUG] analyze_and_track_masks: Processing {B} frames, min_size={min_size}, max_dist={max_dist}")
+
+    tracked_masks = torch.zeros_like(mask_batch)
+
+    next_player_id = 1
+    prev_regions = []  # List of {player_id, centroid, area}
+    player_timelines = {}  # player_id -> list of frame indices
+    frame_player_counts = []  # Number of players per frame
+
+    for frame_idx in range(B):
+        # Binary threshold and convert to numpy for scipy
+        binary = (mask_batch[frame_idx] > threshold).cpu().numpy()
+
+        # Connected component labeling
+        labeled, num_features = scipy_label(binary)
+
+        # Extract current frame regions
+        curr_regions = []
+        for i in range(1, num_features + 1):
+            region_mask = (labeled == i)
+            area = region_mask.sum()
+            if area >= min_size:
+                ys, xs = np.where(region_mask)
+                centroid = (ys.mean(), xs.mean())
+                curr_regions.append({
+                    'local_label': i,
+                    'centroid': centroid,
+                    'area': int(area),
+                    'mask': region_mask
+                })
+
+        # Match to previous frame using Hungarian algorithm on centroid distance
+        if prev_regions and curr_regions:
+            cost_matrix = np.zeros((len(prev_regions), len(curr_regions)))
+            for i, prev in enumerate(prev_regions):
+                for j, curr in enumerate(curr_regions):
+                    dist = np.sqrt((prev['centroid'][0] - curr['centroid'][0])**2 +
+                                  (prev['centroid'][1] - curr['centroid'][1])**2)
+                    cost_matrix[i, j] = dist
+
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+            matched_curr = set()
+            for r, c in zip(row_ind, col_ind):
+                if cost_matrix[r, c] < max_dist:
+                    # Assign previous ID to matched region
+                    curr_regions[c]['player_id'] = prev_regions[r]['player_id']
+                    matched_curr.add(c)
+
+            # Unmatched current regions get new IDs
+            for c, region in enumerate(curr_regions):
+                if c not in matched_curr:
+                    region['player_id'] = next_player_id
+                    next_player_id += 1
+        else:
+            # First frame or no previous regions - assign new IDs
+            for region in curr_regions:
+                region['player_id'] = next_player_id
+                next_player_id += 1
+
+        # Build output mask for this frame
+        frame_output = np.zeros((H, W), dtype=np.float32)
+        for region in curr_regions:
+            frame_output[region['mask']] = region['player_id']
+
+            # Track timeline
+            pid = region['player_id']
+            if pid not in player_timelines:
+                player_timelines[pid] = []
+            player_timelines[pid].append(frame_idx)
+
+        tracked_masks[frame_idx] = torch.from_numpy(frame_output).to(device)
+        frame_player_counts.append(len(curr_regions))
+
+        # Update prev_regions for next frame (without the mask to save memory)
+        prev_regions = [{'player_id': r['player_id'], 'centroid': r['centroid'], 'area': r['area']}
+                       for r in curr_regions]
+
+    # Build tracking info
+    total_players = next_player_id - 1
+    max_concurrent = max(frame_player_counts) if frame_player_counts else 0
+
+    tracking_info = {
+        'total_players': total_players,
+        'max_concurrent': max_concurrent,
+        'frame_count': B,
+        'player_timelines': {str(k): v for k, v in player_timelines.items()},  # JSON-safe keys
+        'frame_player_counts': frame_player_counts
+    }
+
+    elapsed = time.time() - start_time
+    print(f"[DEBUG] analyze_and_track_masks: Found {total_players} unique players, max {max_concurrent} concurrent, took {elapsed:.4f}s")
+
+    return tracked_masks, tracking_info
 
 
 class InpaintCropImproved:
@@ -1801,3 +1917,186 @@ class TemporalCollapse:
         print(f"[DEBUG] TemporalCollapse: Kept indices: {keep_indices[:10]}{'...' if len(keep_indices) > 10 else ''}")
 
         return (collapsed_stitcher, collapsed_images)
+
+
+class MaskRegionAnalyzer:
+    """
+    Analyzes mask video to detect and track individual regions (e.g., player silhouettes).
+    Assigns persistent IDs to each region across frames using centroid-based tracking.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "min_region_size": ("INT", {"default": 500, "min": 1, "max": 100000, "step": 1,
+                    "tooltip": "Minimum pixel count for a region to be tracked (filters noise)"}),
+                "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Binarization threshold for mask"}),
+                "max_track_distance": ("INT", {"default": 150, "min": 1, "max": 1000, "step": 1,
+                    "tooltip": "Maximum centroid movement (pixels) between frames for tracking"}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "STRING", "INT", "INT")
+    RETURN_NAMES = ("tracked_mask", "tracking_info", "total_players", "max_concurrent")
+    FUNCTION = "analyze"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Detect and track mask regions across frames with persistent IDs"
+
+    def analyze(self, mask, min_region_size, threshold, max_track_distance):
+        print(f"[DEBUG] MaskRegionAnalyzer: Input mask shape {mask.shape}")
+
+        tracked_mask, tracking_info = analyze_and_track_masks(
+            mask,
+            min_size=min_region_size,
+            max_dist=max_track_distance,
+            threshold=threshold
+        )
+
+        tracking_info_json = json.dumps(tracking_info, indent=2)
+        total_players = tracking_info['total_players']
+        max_concurrent = tracking_info['max_concurrent']
+
+        print(f"[DEBUG] MaskRegionAnalyzer: Output - {total_players} total players, {max_concurrent} max concurrent")
+
+        return (tracked_mask, tracking_info_json, total_players, max_concurrent)
+
+
+class MaskPlayerFilter:
+    """
+    Filters a tracked mask to output only selected player IDs.
+    Use batch_index to process players in groups (0=players 1-4, 1=players 5-8, etc.)
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tracked_mask": ("MASK",),
+                "batch_size": ("INT", {"default": 4, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "Number of players per batch"}),
+                "batch_index": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1,
+                    "tooltip": "Which batch to output (0=first N players, 1=next N, etc.)"}),
+            },
+            "optional": {
+                "player_ids": ("STRING", {"default": "",
+                    "tooltip": "Override: comma-separated player IDs (e.g., '1,2,3,4'). Leave empty to use batch_index."}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "STRING")
+    RETURN_NAMES = ("filtered_mask", "selected_ids")
+    FUNCTION = "filter_players"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Filter tracked mask to selected player batch"
+
+    def filter_players(self, tracked_mask, batch_size, batch_index, player_ids=""):
+        device = tracked_mask.device
+
+        # Determine which player IDs to include
+        if player_ids.strip():
+            # Parse manual player IDs
+            try:
+                selected_ids = [int(x.strip()) for x in player_ids.split(",") if x.strip()]
+            except ValueError:
+                print(f"[DEBUG] MaskPlayerFilter: Invalid player_ids format, using batch_index")
+                selected_ids = []
+        else:
+            selected_ids = []
+
+        if not selected_ids:
+            # Use batch_index to determine IDs
+            start_id = batch_index * batch_size + 1
+            end_id = start_id + batch_size
+            selected_ids = list(range(start_id, end_id))
+
+        print(f"[DEBUG] MaskPlayerFilter: Filtering for player IDs {selected_ids}")
+
+        # Create binary mask where tracked_mask value is in selected_ids
+        # tracked_mask has player IDs as float values (1.0, 2.0, 3.0, etc.)
+        filtered_mask = torch.zeros_like(tracked_mask)
+
+        for pid in selected_ids:
+            # Match pixels with this player ID (with small tolerance for float comparison)
+            player_pixels = (tracked_mask >= pid - 0.5) & (tracked_mask < pid + 0.5)
+            filtered_mask[player_pixels] = 1.0
+
+        selected_ids_str = ",".join(str(x) for x in selected_ids)
+        print(f"[DEBUG] MaskPlayerFilter: Output mask has {(filtered_mask > 0).sum().item()} pixels")
+
+        return (filtered_mask, selected_ids_str)
+
+
+class MaskColorizer:
+    """
+    Debug visualization: colors each tracked player region with a unique color.
+    Useful for verifying tracking quality.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tracked_mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("colored_image",)
+    FUNCTION = "colorize"
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Visualize tracked mask regions with unique colors"
+
+    def colorize(self, tracked_mask):
+        device = tracked_mask.device
+        B, H, W = tracked_mask.shape
+
+        # Define a distinct color palette (up to 20 colors)
+        color_palette = torch.tensor([
+            [0.0, 0.0, 0.0],       # 0: Background (black)
+            [1.0, 0.0, 0.0],       # 1: Red
+            [0.0, 1.0, 0.0],       # 2: Green
+            [0.0, 0.0, 1.0],       # 3: Blue
+            [1.0, 1.0, 0.0],       # 4: Yellow
+            [1.0, 0.0, 1.0],       # 5: Magenta
+            [0.0, 1.0, 1.0],       # 6: Cyan
+            [1.0, 0.5, 0.0],       # 7: Orange
+            [0.5, 0.0, 1.0],       # 8: Purple
+            [0.0, 1.0, 0.5],       # 9: Spring Green
+            [1.0, 0.5, 0.5],       # 10: Light Red
+            [0.5, 1.0, 0.5],       # 11: Light Green
+            [0.5, 0.5, 1.0],       # 12: Light Blue
+            [0.8, 0.8, 0.0],       # 13: Olive
+            [0.8, 0.0, 0.8],       # 14: Dark Magenta
+            [0.0, 0.8, 0.8],       # 15: Teal
+            [1.0, 0.8, 0.6],       # 16: Peach
+            [0.6, 0.8, 1.0],       # 17: Sky Blue
+            [0.8, 0.6, 1.0],       # 18: Lavender
+            [0.6, 1.0, 0.8],       # 19: Mint
+        ], device=device, dtype=torch.float32)
+
+        # Create output image [B, H, W, 3]
+        colored_image = torch.zeros(B, H, W, 3, device=device, dtype=torch.float32)
+
+        for b in range(B):
+            frame_mask = tracked_mask[b]  # [H, W]
+            unique_ids = torch.unique(frame_mask)
+
+            for uid in unique_ids:
+                uid_int = int(uid.item())
+                if uid_int == 0:
+                    continue  # Skip background
+
+                # Get color (cycle through palette if more players than colors)
+                color_idx = uid_int % len(color_palette)
+                if color_idx == 0:
+                    color_idx = 1  # Avoid black for non-background
+
+                color = color_palette[color_idx]
+
+                # Apply color to pixels with this ID
+                mask_pixels = (frame_mask >= uid_int - 0.5) & (frame_mask < uid_int + 0.5)
+                colored_image[b, mask_pixels] = color
+
+        print(f"[DEBUG] MaskColorizer: Created colored visualization {colored_image.shape}")
+
+        return (colored_image,)
